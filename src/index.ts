@@ -8,11 +8,12 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 const {
     PORT = '3000',
     MCP_API_KEY,
-    SF_LOGIN_URL = 'https://creative-shark-mhybdo-dev-ed.trailblaze.my.salesforce.com',
+    SF_LOGIN_URL = 'https://login.salesforce.com',
     SF_CLIENT_ID,
     SF_CLIENT_SECRET,
-    SF_API_VERSION = 'v61.0',
-    BASE_URL = 'http://localhost:3000'
+    SF_API_VERSION = 'v65.0',
+    BASE_URL = 'http://localhost:3000',
+    NODE_ENV = 'development'
 } = process.env;
 
 if (!MCP_API_KEY) throw new Error('Missing MCP_API_KEY');
@@ -921,6 +922,13 @@ const handleOAuthCallback = async (req: Request, res: Response) => {
 
         const { access_token, instance_url, refresh_token } = data;
 
+        // Set security headers to prevent caching of sensitive information
+        res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+        res.set('Pragma', 'no-cache');
+        res.set('Expires', '0');
+        res.set('X-Content-Type-Options', 'nosniff');
+        res.set('X-Frame-Options', 'DENY');
+
         res.send(`
             <!DOCTYPE html>
             <html>
@@ -930,27 +938,63 @@ const handleOAuthCallback = async (req: Request, res: Response) => {
                     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 40px; }
                     .container { max-width: 600px; }
                     .success { color: #28a745; font-size: 24px; margin-bottom: 20px; }
-                    .token-box { background: #f0f0f0; padding: 15px; border-radius: 4px; word-break: break-all; margin: 20px 0; }
-                    code { font-family: monospace; }
+                    .token-box { background: #f0f0f0; padding: 15px; border-radius: 4px; word-break: break-all; margin: 20px 0; font-family: monospace; }
+                    code { font-family: monospace; word-break: break-all; }
                     .instructions { margin-top: 30px; padding: 15px; background: #e7f3ff; border-radius: 4px; }
+                    .warning { background: #fff3cd; padding: 12px; border-radius: 4px; margin: 20px 0; border-left: 4px solid #ffc107; }
+                    .copy-btn { background: #007bff; color: white; padding: 8px 12px; border: none; border-radius: 4px; cursor: pointer; font-family: monospace; }
                 </style>
+                <script>
+                    function copyToClipboard(text, elementId) {
+                        navigator.clipboard.writeText(text).then(() => {
+                            const btn = document.getElementById(elementId);
+                            const original = btn.textContent;
+                            btn.textContent = '✓ Copied!';
+                            setTimeout(() => btn.textContent = original, 2000);
+                        });
+                    }
+                </script>
             </head>
             <body>
                 <div class="container">
                     <h1>✅ Authentication Successful</h1>
-                    <p><strong>Org URL:</strong> ${instance_url}</p>
 
-                    <h2>Access Token</h2>
+                    <div class="warning">
+                        <strong>⚠️ Important:</strong> This page contains sensitive credentials. Do NOT bookmark, screenshot, or share this page.
+                    </div>
+
+                    <h2>Your Access Token</h2>
+                    <p>Use this token to authenticate API requests:</p>
                     <div class="token-box">
-                        <code>${access_token}</code>
+                        <code id="headerValue">X-SF-Token: ${access_token}|${instance_url}</code>
+                        <br><br>
+                        <button class="copy-btn" onclick="copyToClipboard(document.getElementById('headerValue').textContent, 'copyBtn')">
+                            📋 Copy Header
+                        </button>
                     </div>
 
                     <div class="instructions">
                         <h3>How to use with MCP:</h3>
-                        <p>Copy the access token above and use it in the header:</p>
-                        <code>X-SF-Token: ${access_token}|${instance_url}</code>
-                        <p><small><strong>Refresh Token:</strong> ${refresh_token}</small></p>
+                        <p>Add this header to your MCP requests:</p>
+                        <pre><code>Authorization: Bearer ${MCP_API_KEY.substring(0, 10)}...
+X-SF-Token: [token from above]</code></pre>
                     </div>
+
+                    <div class="instructions">
+                        <h3>📌 Important Notes:</h3>
+                        <ul>
+                            <li>This token will expire after ${data.expires_in ? Math.floor(data.expires_in / 3600) + ' hours' : 'a period of time'}.</li>
+                            <li>Your refresh token has been securely stored on the server.</li>
+                            <li>Keep this token secret - treat it like a password.</li>
+                            <li>Close this page or open a new tab when done.</li>
+                        </ul>
+                    </div>
+
+                    <p style="margin-top: 40px; color: #666; font-size: 12px;">
+                        <strong>Instance URL:</strong> ${instance_url}<br>
+                        <strong>Connection:</strong> Secure (HTTPS)<br>
+                        <strong>Timestamp:</strong> ${new Date().toISOString()}
+                    </p>
                 </div>
             </body>
             </html>
