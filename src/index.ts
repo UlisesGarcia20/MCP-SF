@@ -4,24 +4,35 @@ import express, { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { getOrgConfig, listEnabledOrgs, getDefaultOrgId } from './config.js';
 
 const {
     PORT = '3000',
     MCP_API_KEY,
-    SF_LOGIN_URL = 'https://login.salesforce.com',
-    SF_CLIENT_ID,
-    SF_CLIENT_SECRET,
-    SF_API_VERSION = 'v65.0',
     BASE_URL = 'http://localhost:3000',
     NODE_ENV = 'development'
 } = process.env;
 
 if (!MCP_API_KEY) throw new Error('Missing MCP_API_KEY');
-if (!SF_CLIENT_ID) throw new Error('Missing SF_CLIENT_ID');
-if (!SF_CLIENT_SECRET) throw new Error('Missing SF_CLIENT_SECRET');
+
+const enabledOrgs = listEnabledOrgs();
+if (enabledOrgs.length === 0) {
+    throw new Error('No organizations configured. Set ORG_* environment variables.');
+}
+
+console.log(`✓ Loaded ${enabledOrgs.length} organization(s): ${enabledOrgs.map(o => o.orgId).join(', ')}`);
+
+// Helper functions for PKCE
+function generateCodeVerifier(): string {
+    return crypto.randomBytes(32).toString('base64url');
+}
+
+function generateCodeChallenge(verifier: string): string {
+    return crypto.createHash('sha256').update(verifier).digest('base64url');
+}
 
 // Store OAuth states temporarily (use Redis in production)
-const authStates = new Map<string, { timestamp: number; instance_url?: string }>();
+const authStates = new Map<string, { timestamp: number; orgId: string; codeVerifier?: string }>();
 
 // Clean up expired states every 5 minutes
 setInterval(() => {
@@ -38,6 +49,7 @@ type SalesforceTokenResponse = {
     token_type: string;
     instance_url?: string;
     refresh_token?: string;
+    expires_in?: number;
 };
 
 async function sfRequest<T>(
@@ -94,7 +106,7 @@ function requireApiKey(req: Request, res: Response, next: NextFunction) {
 }
 
 // Create MCP server with user context
-function createMcpServer(userToken: string, instanceUrl: string) {
+function createMcpServer(userToken: string, instanceUrl: string, apiVersion: string = 'v65.0') {
     const server = new McpServer({
         name: 'salesforce-mcp',
         version: '1.0.0'
@@ -114,7 +126,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
                     updateable: boolean;
                     deletable: boolean;
                 }>;
-            }>(`/services/data/${SF_API_VERSION}/sobjects`, userToken, instanceUrl);
+            }>(`/services/data/${apiVersion}/sobjects`, userToken, instanceUrl);
 
             return {
                 content: [
@@ -135,7 +147,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
         },
         async ({ object }) => {
             const data = await sfRequest(
-                `/services/data/${SF_API_VERSION}/sobjects/${encodeURIComponent(object)}/describe`,
+                `/services/data/${apiVersion}/sobjects/${encodeURIComponent(object)}/describe`,
                 userToken,
                 instanceUrl
             );
@@ -159,7 +171,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
         },
         async ({ soql }) => {
             let allRecords: any[] = [];
-            let nextRecordsUrl: string | null = `/services/data/${SF_API_VERSION}/query?q=${encodeURIComponent(soql)}`;
+            let nextRecordsUrl: string | null = `/services/data/${apiVersion}/query?q=${encodeURIComponent(soql)}`;
 
             while (nextRecordsUrl) {
                 const data = (await sfRequest(
@@ -190,7 +202,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
         },
         async ({ soql }) => {
             let allRecords: any[] = [];
-            let nextRecordsUrl: string | null = `/services/data/${SF_API_VERSION}/tooling/query?q=${encodeURIComponent(soql)}`;
+            let nextRecordsUrl: string | null = `/services/data/${apiVersion}/tooling/query?q=${encodeURIComponent(soql)}`;
 
             while (nextRecordsUrl) {
                 const data = (await sfRequest(
@@ -219,7 +231,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
         {},
         async () => {
             const data = (await sfRequest(
-                `/services/data/${SF_API_VERSION}/query?q=${encodeURIComponent('SELECT Id, Name, DefaultLanguage, TimeZoneSidKey, OrganizationType, InstanceName, IsSandbox, LanguageLocaleKey FROM Organization LIMIT 1')}`,
+                `/services/data/${apiVersion}/query?q=${encodeURIComponent('SELECT Id, Name, DefaultLanguage, TimeZoneSidKey, OrganizationType, InstanceName, IsSandbox, LanguageLocaleKey FROM Organization LIMIT 1')}`,
                 userToken,
                 instanceUrl
             )) as any;
@@ -245,7 +257,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
         },
         async ({ object, field }) => {
             const data = (await sfRequest(
-                `/services/data/${SF_API_VERSION}/sobjects/${encodeURIComponent(object)}/describe`,
+                `/services/data/${apiVersion}/sobjects/${encodeURIComponent(object)}/describe`,
                 userToken,
                 instanceUrl
             )) as any;
@@ -291,7 +303,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
         },
         async ({ object, id }) => {
             const data = await sfRequest(
-                `/services/data/${SF_API_VERSION}/sobjects/${encodeURIComponent(object)}/${encodeURIComponent(id)}`,
+                `/services/data/${apiVersion}/sobjects/${encodeURIComponent(object)}/${encodeURIComponent(id)}`,
                 userToken,
                 instanceUrl
             );
@@ -316,7 +328,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
         },
         async ({ object, fields }) => {
             const data = await sfRequest(
-                `/services/data/${SF_API_VERSION}/sobjects/${encodeURIComponent(object)}`,
+                `/services/data/${apiVersion}/sobjects/${encodeURIComponent(object)}`,
                 userToken,
                 instanceUrl,
                 {
@@ -346,7 +358,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
         },
         async ({ object, id, fields }) => {
             await sfRequest(
-                `/services/data/${SF_API_VERSION}/sobjects/${encodeURIComponent(object)}/${encodeURIComponent(id)}`,
+                `/services/data/${apiVersion}/sobjects/${encodeURIComponent(object)}/${encodeURIComponent(id)}`,
                 userToken,
                 instanceUrl,
                 {
@@ -375,7 +387,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
         },
         async ({ object, id }) => {
             await sfRequest(
-                `/services/data/${SF_API_VERSION}/sobjects/${encodeURIComponent(object)}/${encodeURIComponent(id)}`,
+                `/services/data/${apiVersion}/sobjects/${encodeURIComponent(object)}/${encodeURIComponent(id)}`,
                 userToken,
                 instanceUrl,
                 {
@@ -403,7 +415,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
         async ({ object }) => {
             const soql = `SELECT COUNT() FROM ${object}`;
             const data = (await sfRequest(
-                `/services/data/${SF_API_VERSION}/query?q=${encodeURIComponent(soql)}`,
+                `/services/data/${apiVersion}/query?q=${encodeURIComponent(soql)}`,
                 userToken,
                 instanceUrl
             )) as any;
@@ -429,7 +441,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
             const whereClause = object ? ` WHERE EntityDefinition.DeveloperName = '${object}'` : '';
             const soql = `SELECT Id, EntityDefinition.DeveloperName, ValidationName, ErrorDisplayField, ErrorMessage, Active FROM ValidationRule${whereClause} LIMIT 200`;
             const data = (await sfRequest(
-                `/services/data/${SF_API_VERSION}/tooling/query?q=${encodeURIComponent(soql)}`,
+                `/services/data/${apiVersion}/tooling/query?q=${encodeURIComponent(soql)}`,
                 userToken,
                 instanceUrl
             )) as any;
@@ -455,7 +467,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
             const whereClause = status ? ` WHERE Status = '${status}'` : '';
             const soql = `SELECT Id, ApiName, Label, ProcessType, Status, TriggerType, LastModifiedDate FROM FlowDefinitionView${whereClause} LIMIT 200`;
             const data = (await sfRequest(
-                `/services/data/${SF_API_VERSION}/query?q=${encodeURIComponent(soql)}`,
+                `/services/data/${apiVersion}/query?q=${encodeURIComponent(soql)}`,
                 userToken,
                 instanceUrl
             )) as any;
@@ -484,7 +496,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
             const soql = `SELECT CreatedDate, CreatedBy.Name, Action, Section, Display FROM SetupAuditTrail WHERE CreatedDate >= ${isoDate}T00:00:00Z ORDER BY CreatedDate DESC LIMIT 2000`;
 
             let allRecords: any[] = [];
-            let nextRecordsUrl: string | null = `/services/data/${SF_API_VERSION}/query?q=${encodeURIComponent(soql)}`;
+            let nextRecordsUrl: string | null = `/services/data/${apiVersion}/query?q=${encodeURIComponent(soql)}`;
 
             while (nextRecordsUrl) {
                 const data = (await sfRequest(
@@ -514,7 +526,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
         async () => {
             const soql = `SELECT QualifiedApiName, InternalSharingModel, ExternalSharingModel FROM EntityDefinition WHERE IsCustomizable = true LIMIT 200`;
             const data = (await sfRequest(
-                `/services/data/${SF_API_VERSION}/tooling/query?q=${encodeURIComponent(soql)}`,
+                `/services/data/${apiVersion}/tooling/query?q=${encodeURIComponent(soql)}`,
                 userToken,
                 instanceUrl
             )) as any;
@@ -537,7 +549,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
         async () => {
             const soql = `SELECT Id, DeveloperName, MasterLabel, Endpoint, Protocol FROM NamedCredential LIMIT 200`;
             const data = (await sfRequest(
-                `/services/data/${SF_API_VERSION}/tooling/query?q=${encodeURIComponent(soql)}`,
+                `/services/data/${apiVersion}/tooling/query?q=${encodeURIComponent(soql)}`,
                 userToken,
                 instanceUrl
             )) as any;
@@ -560,7 +572,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
         async () => {
             const soql = `SELECT Id, SubscriberPackage.Name, SubscriberPackage.NamespacePrefix, SubscriberPackageVersion.MajorVersion FROM InstalledSubscriberPackage LIMIT 200`;
             const data = (await sfRequest(
-                `/services/data/${SF_API_VERSION}/tooling/query?q=${encodeURIComponent(soql)}`,
+                `/services/data/${apiVersion}/tooling/query?q=${encodeURIComponent(soql)}`,
                 userToken,
                 instanceUrl
             )) as any;
@@ -584,7 +596,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
         },
         async ({ sosl }) => {
             const data = await sfRequest(
-                `/services/data/${SF_API_VERSION}/search/?q=${encodeURIComponent(sosl)}`,
+                `/services/data/${apiVersion}/search/?q=${encodeURIComponent(sosl)}`,
                 userToken,
                 instanceUrl
             );
@@ -610,7 +622,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
             const whereClause = object ? ` WHERE TableEnumOrId = '${object}'` : '';
             const soql = `SELECT Id, Name, TableEnumOrId, TriggerType, Active FROM WorkflowRule${whereClause} LIMIT 200`;
             const data = (await sfRequest(
-                `/services/data/${SF_API_VERSION}/tooling/query?q=${encodeURIComponent(soql)}`,
+                `/services/data/${apiVersion}/tooling/query?q=${encodeURIComponent(soql)}`,
                 userToken,
                 instanceUrl
             )) as any;
@@ -636,7 +648,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
             if (type_name) {
                 const soql = `SELECT Id, DeveloperName FROM ${type_name}__mdt LIMIT 200`;
                 const data = (await sfRequest(
-                    `/services/data/${SF_API_VERSION}/query?q=${encodeURIComponent(soql)}`,
+                    `/services/data/${apiVersion}/query?q=${encodeURIComponent(soql)}`,
                     userToken,
                     instanceUrl
                 )) as any;
@@ -651,7 +663,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
             } else {
                 const soql = `SELECT Id, DeveloperName, MasterLabel FROM CustomMetadata LIMIT 200`;
                 const data = (await sfRequest(
-                    `/services/data/${SF_API_VERSION}/tooling/query?q=${encodeURIComponent(soql)}`,
+                    `/services/data/${apiVersion}/tooling/query?q=${encodeURIComponent(soql)}`,
                     userToken,
                     instanceUrl
                 )) as any;
@@ -677,7 +689,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
             if (setting_name) {
                 const soql = `SELECT Id, DeveloperName FROM ${setting_name}__c LIMIT 200`;
                 const data = (await sfRequest(
-                    `/services/data/${SF_API_VERSION}/query?q=${encodeURIComponent(soql)}`,
+                    `/services/data/${apiVersion}/query?q=${encodeURIComponent(soql)}`,
                     userToken,
                     instanceUrl
                 )) as any;
@@ -692,7 +704,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
             } else {
                 const soql = `SELECT Id, DeveloperName, MasterLabel FROM CustomSetting LIMIT 200`;
                 const data = (await sfRequest(
-                    `/services/data/${SF_API_VERSION}/tooling/query?q=${encodeURIComponent(soql)}`,
+                    `/services/data/${apiVersion}/tooling/query?q=${encodeURIComponent(soql)}`,
                     userToken,
                     instanceUrl
                 )) as any;
@@ -721,7 +733,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
             if (type === 'reports' || type === 'both') {
                 const reportSoql = `SELECT Id, Name, FolderName, CreatedDate, LastModifiedDate FROM Report LIMIT 200`;
                 const reports = (await sfRequest(
-                    `/services/data/${SF_API_VERSION}/query?q=${encodeURIComponent(reportSoql)}`,
+                    `/services/data/${apiVersion}/query?q=${encodeURIComponent(reportSoql)}`,
                     userToken,
                     instanceUrl
                 )) as any;
@@ -731,7 +743,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
             if (type === 'dashboards' || type === 'both') {
                 const dashboardSoql = `SELECT Id, Title, FolderName, CreatedDate, LastModifiedDate FROM Dashboard LIMIT 200`;
                 const dashboards = (await sfRequest(
-                    `/services/data/${SF_API_VERSION}/query?q=${encodeURIComponent(dashboardSoql)}`,
+                    `/services/data/${apiVersion}/query?q=${encodeURIComponent(dashboardSoql)}`,
                     userToken,
                     instanceUrl
                 )) as any;
@@ -759,7 +771,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
             const whereClause = object ? ` WHERE EntityDefinitionId.QualifiedApiName = '${object}'` : '';
             const soql = `SELECT Id, Name, EntityDefinitionId.QualifiedApiName, LayoutType FROM Layout${whereClause} LIMIT 200`;
             const data = (await sfRequest(
-                `/services/data/${SF_API_VERSION}/tooling/query?q=${encodeURIComponent(soql)}`,
+                `/services/data/${apiVersion}/tooling/query?q=${encodeURIComponent(soql)}`,
                 userToken,
                 instanceUrl
             )) as any;
@@ -785,7 +797,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
             const whereClause = object ? ` WHERE TableEnumOrId = '${object}'` : '';
             const soql = `SELECT Id, Name, TableEnumOrId, Active FROM ProcessDefinition${whereClause} LIMIT 200`;
             const data = (await sfRequest(
-                `/services/data/${SF_API_VERSION}/tooling/query?q=${encodeURIComponent(soql)}`,
+                `/services/data/${apiVersion}/tooling/query?q=${encodeURIComponent(soql)}`,
                 userToken,
                 instanceUrl
             )) as any;
@@ -813,7 +825,7 @@ function createMcpServer(userToken: string, instanceUrl: string) {
             const soql = `SELECT Field, PermissionsRead, PermissionsEdit, Parent.Profile.Name FROM FieldPermissions WHERE SobjectType = '${object}'${whereClause} LIMIT 1000`;
 
             let allRecords: any[] = [];
-            let nextRecordsUrl: string | null = `/services/data/${SF_API_VERSION}/tooling/query?q=${encodeURIComponent(soql)}`;
+            let nextRecordsUrl: string | null = `/services/data/${apiVersion}/tooling/query?q=${encodeURIComponent(soql)}`;
 
             while (nextRecordsUrl) {
                 const data = (await sfRequest(
@@ -842,17 +854,48 @@ function createMcpServer(userToken: string, instanceUrl: string) {
 const app = express();
 app.use(express.json());
 
+// List available organizations
+app.get('/orgs', (_req: Request, res: Response) => {
+    const orgs = listEnabledOrgs();
+    res.json({
+        orgs: orgs.map(org => ({
+            id: org.orgId,
+            name: org.name,
+            authorizeUrl: `${BASE_URL}/oauth/authorize?org_id=${org.orgId}`
+        }))
+    });
+});
+
 // OAuth authorization endpoint
 app.get('/oauth/authorize', (req: Request, res: Response) => {
-    const state = crypto.randomBytes(32).toString('hex');
-    authStates.set(state, { timestamp: Date.now() });
+    const orgId = (req.query.org_id as string) || getDefaultOrgId();
 
-    const authUrl = new URL(`${SF_LOGIN_URL}/services/oauth2/authorize`);
-    authUrl.searchParams.set('client_id', SF_CLIENT_ID!);
+    if (!orgId) {
+        return res.status(400).json({ error: 'Missing org_id parameter' });
+    }
+
+    const orgConfig = getOrgConfig(orgId);
+    if (!orgConfig) {
+        return res.status(404).json({
+            error: `Organization ${orgId} not found or disabled`,
+            availableOrgs: listEnabledOrgs().map(o => o.orgId)
+        });
+    }
+
+    const state = crypto.randomBytes(32).toString('hex');
+    const codeVerifier = generateCodeVerifier();
+    const codeChallenge = generateCodeChallenge(codeVerifier);
+
+    authStates.set(state, { timestamp: Date.now(), orgId, codeVerifier });
+
+    const authUrl = new URL(`${orgConfig.loginUrl}/services/oauth2/authorize`);
+    authUrl.searchParams.set('client_id', orgConfig.clientId);
     authUrl.searchParams.set('redirect_uri', `${BASE_URL}/callback`);
     authUrl.searchParams.set('response_type', 'code');
     authUrl.searchParams.set('scope', 'full');
     authUrl.searchParams.set('state', state);
+    authUrl.searchParams.set('code_challenge', codeChallenge);
+    authUrl.searchParams.set('code_challenge_method', 'S256');
     authUrl.searchParams.set('prompt', 'login');
 
     res.redirect(authUrl.toString());
@@ -860,15 +903,30 @@ app.get('/oauth/authorize', (req: Request, res: Response) => {
 
 // Alias for /authorize (PKCE-aware - forward code_challenge but don't require code_verifier)
 app.get('/authorize', (req: Request, res: Response) => {
+    const orgId = (req.query.org_id as string) || getDefaultOrgId();
     const { code_challenge, code_challenge_method, state } = req.query;
-    authStates.set(state as string, { timestamp: Date.now() });
 
-    const authUrl = new URL(`${SF_LOGIN_URL}/services/oauth2/authorize`);
-    authUrl.searchParams.set('client_id', SF_CLIENT_ID!);
+    if (!orgId) {
+        return res.status(400).json({ error: 'Missing org_id parameter' });
+    }
+
+    const orgConfig = getOrgConfig(orgId);
+    if (!orgConfig) {
+        return res.status(404).json({
+            error: `Organization ${orgId} not found or disabled`,
+            availableOrgs: listEnabledOrgs().map(o => o.orgId)
+        });
+    }
+
+    const stateValue = (state as string) || crypto.randomBytes(32).toString('hex');
+    authStates.set(stateValue, { timestamp: Date.now(), orgId });
+
+    const authUrl = new URL(`${orgConfig.loginUrl}/services/oauth2/authorize`);
+    authUrl.searchParams.set('client_id', orgConfig.clientId);
     authUrl.searchParams.set('redirect_uri', `${BASE_URL}/callback`);
     authUrl.searchParams.set('response_type', 'code');
     authUrl.searchParams.set('scope', 'full');
-    authUrl.searchParams.set('state', (state as string) || crypto.randomBytes(32).toString('hex'));
+    authUrl.searchParams.set('state', stateValue);
 
     if (code_challenge) {
         authUrl.searchParams.set('code_challenge', code_challenge as string);
@@ -893,17 +951,32 @@ const handleOAuthCallback = async (req: Request, res: Response) => {
     if (!authStates.has(state as string)) {
         return res.status(400).send('<h1>Invalid state parameter</h1>');
     }
+
+    const stateData = authStates.get(state as string)!;
     authStates.delete(state as string);
 
+    const orgId = stateData.orgId || getDefaultOrgId();
+    if (!orgId) {
+        return res.status(400).send('<h1>No organization configured</h1>');
+    }
+
+    const orgConfig = getOrgConfig(orgId);
+
+    if (!orgConfig) {
+        return res.status(404).send(`<h1>Organization ${orgId} not found</h1>`);
+    }
+
     try {
-        const tokenUrl = `${SF_LOGIN_URL}/services/oauth2/token`;
-        const body = new URLSearchParams({
+        const tokenUrl = `${orgConfig.loginUrl}/services/oauth2/token`;
+        const bodyParams = {
             grant_type: 'authorization_code',
-            client_id: SF_CLIENT_ID!,
-            client_secret: SF_CLIENT_SECRET!,
+            client_id: orgConfig.clientId,
+            client_secret: orgConfig.clientSecret,
             redirect_uri: `${BASE_URL}/callback`,
-            code: code as string
-        });
+            code: code as string,
+            ...(stateData.codeVerifier && { code_verifier: stateData.codeVerifier })
+        };
+        const body = new URLSearchParams(bodyParams);
 
         const tokenRes = await fetch(tokenUrl, {
             method: 'POST',
@@ -943,6 +1016,7 @@ const handleOAuthCallback = async (req: Request, res: Response) => {
                     .instructions { margin-top: 30px; padding: 15px; background: #e7f3ff; border-radius: 4px; }
                     .warning { background: #fff3cd; padding: 12px; border-radius: 4px; margin: 20px 0; border-left: 4px solid #ffc107; }
                     .copy-btn { background: #007bff; color: white; padding: 8px 12px; border: none; border-radius: 4px; cursor: pointer; font-family: monospace; }
+                    .org-info { background: #f9f9f9; padding: 15px; border-radius: 4px; margin: 20px 0; border: 1px solid #ddd; }
                 </style>
                 <script>
                     function copyToClipboard(text, elementId) {
@@ -958,6 +1032,11 @@ const handleOAuthCallback = async (req: Request, res: Response) => {
             <body>
                 <div class="container">
                     <h1>✅ Authentication Successful</h1>
+
+                    <div class="org-info">
+                        <strong>Organization:</strong> ${orgConfig.name} (${orgId})<br>
+                        <strong>Instance:</strong> ${instance_url}
+                    </div>
 
                     <div class="warning">
                         <strong>⚠️ Important:</strong> This page contains sensitive credentials. Do NOT bookmark, screenshot, or share this page.
@@ -975,9 +1054,10 @@ const handleOAuthCallback = async (req: Request, res: Response) => {
 
                     <div class="instructions">
                         <h3>How to use with MCP:</h3>
-                        <p>Add this header to your MCP requests:</p>
+                        <p>Add these headers to your MCP requests:</p>
                         <pre><code>Authorization: Bearer ${MCP_API_KEY.substring(0, 10)}...
-X-SF-Token: [token from above]</code></pre>
+X-SF-Token: [token from above]
+X-Org-Id: ${orgId}</code></pre>
                     </div>
 
                     <div class="instructions">
@@ -991,8 +1071,6 @@ X-SF-Token: [token from above]</code></pre>
                     </div>
 
                     <p style="margin-top: 40px; color: #666; font-size: 12px;">
-                        <strong>Instance URL:</strong> ${instance_url}<br>
-                        <strong>Connection:</strong> Secure (HTTPS)<br>
                         <strong>Timestamp:</strong> ${new Date().toISOString()}
                     </p>
                 </div>
@@ -1018,29 +1096,49 @@ app.get('/health', (_req: Request, res: Response) => {
     res.json({ ok: true, service: 'salesforce-mcp' });
 });
 
-// Register endpoint - return client configuration
+// Register endpoint - return organizations
 app.post('/register', (req: Request, res: Response) => {
+    const orgs = listEnabledOrgs();
     res.json({
-        client_id: SF_CLIENT_ID,
-        client_secret: SF_CLIENT_SECRET,
-        redirect_uris: [`${BASE_URL}/callback`]
+        organizations: orgs.map(org => ({
+            id: org.orgId,
+            name: org.name,
+            client_id: org.clientId,
+            redirect_uris: [`${BASE_URL}/callback`],
+            authorize_url: `${BASE_URL}/oauth/authorize?org_id=${org.orgId}`
+        }))
     });
 });
 
 // MCP endpoint
 app.all('/mcp', requireApiKey, async (req: Request, res: Response) => {
+    const orgId = (req.query.org_id as string) ||
+                  req.header('X-Org-Id') ||
+                  getDefaultOrgId();
+
+    const orgConfig = getOrgConfig(orgId || '');
+
+    if (!orgConfig) {
+        const availableOrgs = listEnabledOrgs();
+        return res.status(404).json({
+            error: 'Organization not found',
+            availableOrgs: availableOrgs.map(org => org.orgId),
+            hint: 'Provide org_id via query param or X-Org-Id header'
+        });
+    }
+
     const auth = extractUserToken(req);
 
     if (!auth) {
         return res.status(401).json({
             error: 'Missing Salesforce authentication',
             message: 'Provide access token in X-SF-Token header as: "token|instanceUrl"',
-            authorize_url: `${BASE_URL}/oauth/authorize`
+            authorize_url: `${BASE_URL}/oauth/authorize?org_id=${orgId}`
         });
     }
 
     const { token: userToken, instanceUrl } = auth;
-    const server = createMcpServer(userToken, instanceUrl);
+    const server = createMcpServer(userToken, instanceUrl, orgConfig.apiVersion);
     const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined
     });
@@ -1060,6 +1158,15 @@ app.all('/mcp', requireApiKey, async (req: Request, res: Response) => {
 });
 
 app.listen(Number(PORT), () => {
-    console.log(`Salesforce MCP running on port ${PORT}`);
-    console.log(`OAuth authorize URL: ${BASE_URL}/oauth/authorize`);
+    console.log(`\n✓ Salesforce MCP running on port ${PORT}`);
+    console.log(`✓ Base URL: ${BASE_URL}`);
+    console.log(`✓ Environment: ${NODE_ENV}`);
+    console.log(`\n📋 Organizations:`);
+    listEnabledOrgs().forEach(org => {
+        console.log(`  • ${org.name} (${org.orgId}) → ${BASE_URL}/oauth/authorize?org_id=${org.orgId}`);
+    });
+    console.log(`\n📡 MCP Endpoints:`);
+    console.log(`  • ${BASE_URL}/mcp (provide X-SF-Token & X-Org-Id headers)`);
+    console.log(`  • ${BASE_URL}/orgs (list available organizations)`);
+    console.log();
 });
